@@ -579,6 +579,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.validation_metrics_processor.close()
         logger.info("Training completed")
 
+    @torch.no_grad()
     def validation_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -610,6 +611,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info(f"Validation at step {self.step}.")
 
+        for model_part in self.model_parts:
+            model_part.eval()
+
         # create a new dataloader for validation
         dataloader = self.train_spec.build_dataloader_fn(
             dp_world_size=self.dp_degree,
@@ -635,6 +639,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # NOTE: average loss computation assumes same number of tokens in each (local) batch
         self.validation_metrics_processor.log(self.step, loss / step)
         logger.info("Validation completed")
+
+        # clean up
+        for model_part in self.model_parts:
+            model_part.train()
         del dataloader, data_iterator
         self.gc_handler.collect("Perform GC after validation")
 
