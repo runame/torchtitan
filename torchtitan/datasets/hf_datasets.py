@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable
 
 import torch
@@ -16,13 +17,12 @@ from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import Tokenizer
-from torchtitan.config_manager import JobConfig
 from torchtitan.tools.logging import logger
 
 
-def _load_c4_dataset(dataset_path: str):
+def _load_c4_dataset(dataset_path: str, split: str):
     """Load C4 dataset with default configuration."""
-    return load_dataset(dataset_path, name="en", split="train", streaming=True)
+    return load_dataset(dataset_path, name="en", split=split, streaming=True)
 
 
 def _process_c4_text(sample: dict[str, Any]) -> str:
@@ -41,7 +41,12 @@ class DatasetConfig:
 DATASETS = {
     "c4": DatasetConfig(
         path="allenai/c4",
-        loader=_load_c4_dataset,
+        loader=partial(_load_c4_dataset, split="train"),
+        text_processor=_process_c4_text,
+    ),
+    "c4_validation": DatasetConfig(
+        path="allenai/c4",
+        loader=partial(_load_c4_dataset, split="validation"),
         text_processor=_process_c4_text,
     ),
     "c4_test": DatasetConfig(
@@ -168,15 +173,13 @@ def build_hf_dataloader(
     dp_world_size: int,
     dp_rank: int,
     tokenizer: Tokenizer,
-    job_config: JobConfig,
+    dataset_name: str,
+    dataset_path: str | None,
+    batch_size: int,
+    seq_len: int,
     infinite: bool = True,
 ) -> ParallelAwareDataloader:
     """Build a data loader for HuggingFace datasets."""
-    dataset_name = job_config.training.dataset
-    dataset_path = job_config.training.dataset_path
-    batch_size = job_config.training.local_batch_size
-    seq_len = job_config.training.seq_len
-
     hf_ds = HuggingFaceDataset(
         dataset_name=dataset_name,
         dataset_path=dataset_path,

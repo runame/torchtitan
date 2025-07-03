@@ -20,6 +20,7 @@ from torchtitan.components.dataloader import DataloaderStopIteration
 from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
     build_metrics_processor,
+    build_validation_metrics_processor,
     ensure_pp_loss_visible,
 )
 from torchtitan.config_manager import ConfigManager, JobConfig
@@ -44,6 +45,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     dataloader: train_spec_module.BaseDataLoader
     metrics_processor: train_spec_module.MetricsProcessor
+    validation_metrics_processor: train_spec_module.ValidationMetricsProcessor
     checkpointer: CheckpointManager
     train_context: Generator[None, None, None]
 
@@ -101,6 +103,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
         else:
             dp_degree, dp_rank = 1, 0
+        self.dp_degree, self.dp_rank = dp_degree, dp_rank
 
         self.ft_manager = ft.init_ft_manager(job_config)
         # If TorchFT is enabled, the dp_rank and dp_degree, which are used for
@@ -129,12 +132,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             if self.train_spec.build_tokenizer_fn is not None
             else None
         )
+        self.tokenizer = tokenizer
 
         self.dataloader = self.train_spec.build_dataloader_fn(
             dp_world_size=dp_degree,
             dp_rank=dp_rank,
             tokenizer=tokenizer,
-            job_config=job_config,
+            dataset_name=job_config.training.dataset,
+            dataset_path=job_config.training.dataset_path,
+            batch_size=job_config.training.local_batch_size,
+            seq_len=job_config.training.seq_len,
         )
 
         # build model (using meta init)
@@ -163,6 +170,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             job_config, parallel_dims, model_args
         )
         color = self.metrics_processor.color
+        build_validation_metrics_processor_fn = (
+            build_validation_metrics_processor
+            if self.train_spec.build_validation_metrics_processor_fn is None
+            else self.train_spec.build_validation_metrics_processor_fn
+        )
+        self.validation_metrics_processor = build_validation_metrics_processor_fn(
+            job_config, parallel_dims
+        )
 
         # calculate model size and flops per token
         (
@@ -358,8 +373,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             yield input_dict, labels
 
-    def forward_backward_step(
-        self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
+    def forward_and_maybe_backward_step(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        backward: bool = True,
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
@@ -385,6 +403,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 targets, losses = (
                     (labels, []) if self.pp_has_last_stage else (None, None)
                 )
+
+                # TODO: This does not work.
+                if not backward:
+                    # cache the has_backward flag before setting it to False
+                    # this assumes that the schedule and all stages use the same value
+                    previously_set_has_backward = self.pp_schedule._has_backward
+                    # set the has_backward flag to False to only run the forward pass
+                    self.pp_schedule._has_backward = False
+                    # set the has_backward flag to False for all stages
+                    if hasattr(self.pp_schedule, "_stage"):
+                        self.pp_schedule._stage.has_backward = False
+                    elif hasattr(self.pp_schedule, "_stages"):
+                        for stage in self.pp_schedule._stages:
+                            stage.has_backward = False
+
                 if self.pp_has_first_stage:
                     self.pp_schedule.step(
                         inputs, target=targets, losses=losses, input_batch=inputs
@@ -393,6 +426,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     self.pp_schedule.step(
                         target=targets, losses=losses, input_batch=inputs
                     )
+
+                if not backward:
+                    # restore the has_backward flag
+                    self.pp_schedule._has_backward = previously_set_has_backward
+                    if hasattr(self.pp_schedule, "_stage"):
+                        self.pp_schedule._stage.has_backward = (
+                            previously_set_has_backward
+                        )
+                    elif hasattr(self.pp_schedule, "_stages"):
+                        for stage in self.pp_schedule._stages:
+                            stage.has_backward = previously_set_has_backward
 
             # accumulate losses across pipeline microbatches
             # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
@@ -410,7 +454,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     loss = self.loss_fn(pred, labels)
                 # need to free to before bwd to avoid peaking memory
                 del pred
-                loss.backward()
+                if backward:
+                    loss.backward()
 
         return loss
 
@@ -428,7 +473,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # entire step will not be executed.
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
-            loss = self.forward_backward_step(input_dict, labels)
+            loss = self.forward_and_maybe_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
 
         grad_norm = dist_utils.clip_grad_norm_(
@@ -494,13 +539,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.step += 1
                 self.gc_handler.run(self.step)
                 try:
-                    self.train_step(data_iterator)
+                    with torch.profiler.record_function("train_step"):
+                        self.train_step(data_iterator)
                 except DataloaderStopIteration:
                     logger.warning("Ran out of data; last step was canceled.")
                     break
                 self.checkpointer.save(
                     self.step, last_step=(self.step == job_config.training.steps)
                 )
+
+                if (
+                    job_config.validation.every_n_steps is not None
+                    and self.step % job_config.validation.every_n_steps == 0
+                ):
+                    with torch.profiler.record_function("validation"):
+                        self.validate()
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:
@@ -523,7 +576,67 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             time.sleep(2)
 
         self.metrics_processor.close()
+        self.validation_metrics_processor.close()
         logger.info("Training completed")
+
+    def validation_step(
+        self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ):
+        input_dict, labels = next(data_iterator)
+
+        loss = self.forward_and_maybe_backward_step(
+            input_dict=input_dict,
+            labels=labels,
+            backward=False,
+        )
+
+        if self.parallel_dims.dp_cp_enabled or self.ft_manager.enabled:
+            loss = loss.detach()
+            # skip ft manager communication when using semi sync training
+            use_ft_pg = (
+                self.ft_manager.enabled
+                and self.job_config.fault_tolerance.semi_sync_method is None
+            )
+            ft_pg = self.ft_manager.replicate_pg if use_ft_pg else None
+            global_loss = dist_utils.dist_mean(loss, self.world_mesh["dp_cp"], ft_pg)
+        else:
+            global_loss = loss.detach().item()
+
+        return global_loss
+
+    @record
+    def validate(self):
+        job_config = self.job_config
+
+        logger.info(f"Validation at step {self.step}.")
+
+        # create a new dataloader for validation
+        dataloader = self.train_spec.build_dataloader_fn(
+            dp_world_size=self.dp_degree,
+            dp_rank=self.dp_rank,
+            tokenizer=self.tokenizer,
+            dataset_name=job_config.validation.dataset,
+            dataset_path=job_config.validation.dataset_path,
+            batch_size=job_config.validation.local_batch_size,
+            seq_len=job_config.training.seq_len,
+        )
+        data_iterator = self.batch_generator(dataloader)
+
+        step = 0
+        loss = 0.0
+        while step < job_config.validation.steps:
+            step += 1
+            try:
+                loss += self.validation_step(data_iterator)
+            except DataloaderStopIteration:
+                logger.warning("Ran out of data; last validation step was canceled.")
+                break
+
+        # NOTE: average loss computation assumes same number of tokens in each (local) batch
+        self.validation_metrics_processor.log(self.step, loss / step)
+        logger.info("Validation completed")
+        del dataloader, data_iterator
+        self.gc_handler.collect("Perform GC after validation")
 
     def state_dict(self) -> dict[str, Any]:
         return {"step": self.step}

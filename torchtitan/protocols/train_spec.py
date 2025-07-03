@@ -19,7 +19,7 @@ from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.ft import FTManager
 from torchtitan.components.loss import LossFunction
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.components.metrics import MetricsProcessor, ValidationMetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.tokenizer import Tokenizer
 from torchtitan.config_manager import JobConfig
@@ -70,6 +70,7 @@ PipeliningFunction: TypeAlias = Callable[
 DataLoaderBuilder: TypeAlias = Callable[..., BaseDataLoader]
 TokenizerBuilder: TypeAlias = Callable[..., Tokenizer]
 MetricsProcessorBuilder: TypeAlias = Callable[..., MetricsProcessor]
+ValidationMetricsProcessorBuilder: TypeAlias = Callable[..., ValidationMetricsProcessor]
 OptimizersBuilder: TypeAlias = Callable[
     [list[nn.Module], JobConfig, FTManager], OptimizersContainer
 ]
@@ -92,6 +93,9 @@ class TrainSpec:
     build_tokenizer_fn: TokenizerBuilder | None
     build_loss_fn: LossFunctionBuilder
     build_metrics_processor_fn: MetricsProcessorBuilder | None = None
+    build_validation_metrics_processor_fn: ValidationMetricsProcessorBuilder | None = (
+        None
+    )
 
 
 _train_specs = {}

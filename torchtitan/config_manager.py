@@ -254,6 +254,46 @@ class Training:
 
 
 @dataclass
+class Validation:
+    dataset: str = "c4_validation"
+    """Dataset to use"""
+
+    dataset_path: str | None = None
+    """
+    Path to the dataset in the file system. If provided, data will be
+    loaded from this path instead of downloaded.
+    """
+
+    local_batch_size: int = 8
+    """
+    Local batch size (i.e., per-device batch size).
+    Global batch size is `validation.local_batch_size * data-parallel degree`.
+    """
+
+    steps: int = 10
+    """
+    How many validation steps to run. If zero, validation will be disabled.
+    """
+
+    every_n_steps: int | None = 10
+    """Run validation every n training steps. If None, validation is disabled."""
+
+    def __post_init__(self):
+        if self.local_batch_size < 1:
+            raise ValueError(
+                f"validation.local_batch_size must be greater than 0, got {self.local_batch_size}"
+            )
+        if self.steps < 1:
+            raise ValueError(
+                f"validation.steps must be greater than 0, got {self.steps}"
+            )
+        if self.every_n_steps is not None and self.every_n_steps < 1:
+            raise ValueError(
+                f"validation.every_n_steps must be None or greater than 0, got {self.every_n_steps}"
+            )
+
+
+@dataclass
 class Parallelism:
     data_parallel_replicate_degree: int = 1
     """
@@ -670,6 +710,7 @@ class JobConfig:
     optimizer: Optimizer = field(default_factory=Optimizer)
     lr_scheduler: LRScheduler = field(default_factory=LRScheduler)
     training: Training = field(default_factory=Training)
+    validation: Validation = field(default_factory=Validation)
     parallelism: Parallelism = field(default_factory=Parallelism)
     checkpoint: Checkpoint = field(default_factory=Checkpoint)
     activation_checkpoint: ActivationCheckpoint = field(

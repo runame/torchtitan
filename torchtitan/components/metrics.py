@@ -437,3 +437,66 @@ def build_metrics_processor(
         MetricsProcessor: A metrics processor.
     """
     return MetricsProcessor(job_config, parallel_dims, tag)
+
+
+class ValidationMetricsProcessor:
+    """Metrics processor to processes and log the validation metrics.
+
+    The current ValidationMetricsProcessor logs some metrics to STDOUT and some metrics to
+    TensorBoard or WandB.
+
+    Args:
+        job_config (JobConfig): Job configuration.
+        parallel_dims (ParallelDims): Parallel dimensions.
+        tag (Optional[str]): Tag to use for TensorBoard or WandB. Defaults to None.
+    """
+
+    logger: BaseLogger
+    parallel_dims: ParallelDims
+    job_config: JobConfig
+    color: utils.NoColor | utils.Color
+
+    def __init__(
+        self, job_config: JobConfig, parallel_dims: ParallelDims, tag: str | None = None
+    ):
+        self.logger = _build_metric_logger(job_config, parallel_dims, tag)
+        self.job_config = job_config
+        # used for colorful printing
+        self.color = (
+            utils.NoColor()
+            if job_config.metrics.disable_color_printing
+            else utils.Color()
+        )
+
+    def log(self, step: int, loss: float):
+        metrics = {
+            "validation/loss": loss,
+        }
+        self.logger.log(metrics, step)
+
+        color = self.color
+        logger.info(
+            f"{color.red}Step: {step:2}  "
+            f"{color.green}validation loss: {loss:7.4f}{color.reset}"
+        )
+
+    def close(self):
+        self.logger.close()
+
+
+def build_validation_metrics_processor(
+    job_config: JobConfig,
+    parallel_dims: ParallelDims,
+    tag: str | None = None,
+) -> ValidationMetricsProcessor:
+    """Create a validation metrics processor.
+
+    Args:
+        job_config (JobConfig): Job configuration.
+        parallel_dims (ParallelDims): Parallel dimensions.
+        tag (str | None): Tag to use for TensorBoard or WandB. Defaults to None.
+
+    Returns:
+        ValidationMetricsProcessor: A validation metrics processor.
+    """
+    return ValidationMetricsProcessor(job_config, parallel_dims, tag)
